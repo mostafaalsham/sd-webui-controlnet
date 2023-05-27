@@ -565,7 +565,7 @@ class Script(scripts.Script):
         else:
             send_dimen_button.click(fn=send_dimensions, inputs=[input_image], outputs=[self.txt2img_w_slider, self.txt2img_h_slider])
 
-        control_mode = gr.Radio(choices=[e.value for e in external_code.ControlMode], value=default_unit.control_mode.value, label="Control Mode", elem_id=f'{elem_id_tabname}_{tabname}_controlnet_control_mod_radio')
+        control_mode = gr.Radio(choices=[e.value for e in external_code.ControlMode], value=default_unit.control_mode.value, label="Control Mode", elem_id=f'{elem_id_tabname}_{tabname}_controlnet_control_mode_radio')
 
         resize_mode = gr.Radio(choices=[e.value for e in external_code.ResizeMode], value=default_unit.resize_mode.value, label="Resize Mode", elem_id=f'{elem_id_tabname}_{tabname}_controlnet_resize_mode_radio')
 
@@ -883,7 +883,7 @@ class Script(scripts.Script):
             # below is very boring but do not change these. If you change these Apple or Mac may fail.
             y = torch.from_numpy(y)
             y = y.float() / 255.0
-            y = rearrange(y, 'h w c -> c h w')
+            y = rearrange(y, 'h w c -> 1 c h w')
             y = y.clone()
             y = y.to(devices.get_device_for("controlnet"))
             y = y.clone()
@@ -935,7 +935,9 @@ class Script(scripts.Script):
                 y = np.stack([y] * 3, axis=2)
 
             if inpaint_mask is not None:
-                y[inpaint_mask > 127] = - 255
+                inpaint_mask = (inpaint_mask > 127).astype(np.float32) * 255.0
+                inpaint_mask = inpaint_mask[:, :, None].clip(0, 255).astype(np.uint8)
+                y = np.concatenate([y, inpaint_mask], axis=2)
 
             return y
 
@@ -1320,9 +1322,14 @@ class Script(scripts.Script):
                         for detect_map, module in self.detected_map:
                             if detect_map is None:
                                 continue
+                            detect_map = np.ascontiguousarray(detect_map.copy()).copy()
+                            if detect_map.ndim == 3 and detect_map.shape[2] == 4:
+                                inpaint_mask = detect_map[:, :, 3]
+                                detect_map = detect_map[:, :, 0:3]
+                                detect_map[inpaint_mask > 127] = 0
                             processed.images.extend([
                                 Image.fromarray(
-                                    np.ascontiguousarray(detect_map.copy()).copy().clip(0, 255).astype(np.uint8)
+                                    detect_map.clip(0, 255).astype(np.uint8)
                                 )
                             ])
 
