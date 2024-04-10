@@ -5,12 +5,10 @@ Date: Feb 18, 2021
 
 import math
 
-import cv2
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from basicsr.utils import img2tensor
+from modules import devices
 
 nets = {
     'baseline': {
@@ -303,9 +301,9 @@ def createConvFunc(op_type):
 
             shape = weights.shape
             if weights.is_cuda:
-                buffer = torch.cuda.FloatTensor(shape[0], shape[1], 5 * 5).fill_(0)
+                buffer = torch.cuda.FloatTensor(shape[0], shape[1], 5 * 5).fill_(0).to(devices.get_device_for("controlnet"))
             else:
-                buffer = torch.zeros(shape[0], shape[1], 5 * 5)
+                buffer = torch.zeros(shape[0], shape[1], 5 * 5).to(devices.get_device_for("controlnet"))
             weights = weights.view(shape[0], shape[1], -1)
             buffer[:, :, [0, 2, 4, 10, 14, 20, 22, 24]] = weights[:, :, 1:]
             buffer[:, :, [6, 7, 8, 11, 13, 16, 17, 18]] = -weights[:, :, 1:]
@@ -638,16 +636,3 @@ def pidinet():
     dil = 24 #if args.dil else None
     return PiDiNet(60, pdcs, dil=dil, sa=True)
 
-
-if __name__ == '__main__':
-    model = pidinet()
-    ckp = torch.load('table5_pidinet.pth')['state_dict']
-    model.load_state_dict({k.replace('module.',''):v for k, v in ckp.items()})
-    im = cv2.imread('examples/test_my/cat_v4.png')
-    im = img2tensor(im).unsqueeze(0)/255.
-    res = model(im)[-1]
-    res = res>0.5
-    res = res.float()
-    res = (res[0,0].cpu().data.numpy()*255.).astype(np.uint8)
-    print(res.shape)
-    cv2.imwrite('edge.png', res)

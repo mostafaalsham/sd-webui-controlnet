@@ -1,5 +1,21 @@
 import numpy as np
 import cv2
+import os
+
+
+def load_model(filename: str, remote_url: str, model_dir: str) -> str:
+    """
+    Load the model from the specified filename and remote URL if it doesn't exist locally.
+
+    Args:
+        filename (str): The filename of the model.
+        remote_url (str): The remote URL of the model.
+    """
+    local_path = os.path.join(model_dir, filename)
+    if not os.path.exists(local_path):
+        from scripts.utils import load_file_from_url
+        load_file_from_url(remote_url, model_dir=model_dir)
+    return local_path
 
 
 def HWC3(x):
@@ -60,20 +76,3 @@ def safe_step(x, step=2):
     y = x.astype(np.float32) * float(step + 1)
     y = y.astype(np.int32).astype(np.float32) / float(step)
     return y
-
-
-def img2mask(img, H, W, low=10, high=90):
-    assert img.ndim == 3 or img.ndim == 2
-    assert img.dtype == np.uint8
-
-    if img.ndim == 3:
-        y = img[:, :, random.randrange(0, img.shape[2])]
-    else:
-        y = img
-
-    y = cv2.resize(y, (W, H), interpolation=cv2.INTER_CUBIC)
-
-    if random.uniform(0, 1) < 0.5:
-        y = 255 - y
-
-    return y < np.percentile(y, random.randrange(low, high))

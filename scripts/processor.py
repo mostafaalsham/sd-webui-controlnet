@@ -1,8 +1,26 @@
+import os
 import cv2
 import numpy as np
+import torch
+import math
+from dataclasses import dataclass
+from transformers.models.clip.modeling_clip import CLIPVisionModelOutput
 
 from annotator.util import HWC3
-from typing import Callable, Tuple
+from typing import Callable, Tuple, Union
+
+from modules.safe import Extra
+from modules import devices
+from scripts.logging import logger
+
+
+def torch_handler(module: str, name: str):
+    """ Allow all torch access. Bypass A1111 safety whitelist. """
+    if module == 'torch':
+        return getattr(torch, name)
+    if module == 'torch._tensor':
+        # depth_anything dep.
+        return getattr(torch._tensor, name)
 
 
 def pad64(x):
@@ -14,8 +32,11 @@ def safer_memory(x):
     return np.ascontiguousarray(x.copy()).copy()
 
 
-def resize_image_with_pad(input_image, resolution):
-    img = HWC3(input_image)
+def resize_image_with_pad(input_image, resolution, skip_hwc3=False):
+    if skip_hwc3:
+        img = input_image
+    else:
+        img = HWC3(input_image)
     H_raw, W_raw, _ = img.shape
     k = float(resolution) / float(min(H_raw, W_raw))
     interpolation = cv2.INTER_CUBIC if k > 1 else cv2.INTER_AREA
@@ -35,7 +56,7 @@ model_canny = None
 
 
 def canny(img, res=512, thr_a=100, thr_b=200, **kwargs):
-    l, h = thr_a, thr_b
+    l, h = thr_a, thr_b  # noqa: E741
     img, remove_pad = resize_image_with_pad(img, res)
     global model_canny
     if model_canny is None:
@@ -165,6 +186,25 @@ def unload_mlsd():
         unload_mlsd_model()
 
 
+model_depth_anything = None
+
+
+def depth_anything(img, res:int = 512, colored:bool = True, **kwargs):
+    img, remove_pad = resize_image_with_pad(img, res)
+    global model_depth_anything
+    if model_depth_anything is None:
+        with Extra(torch_handler):
+            from annotator.depth_anything import DepthAnythingDetector
+            device = devices.get_device_for("controlnet")
+            model_depth_anything = DepthAnythingDetector(device)
+    return remove_pad(model_depth_anything(img, colored=colored)), True
+
+
+def unload_depth_anything():
+    if model_depth_anything is not None:
+        model_depth_anything.unload_model()
+
+
 model_midas = None
 
 
@@ -226,6 +266,8 @@ class OpenposeModel(object):
             include_body: bool,
             include_hand: bool,
             include_face: bool,
+            use_dw_pose: bool = False,
+            use_animal_pose: bool = False,
             json_pose_callback: Callable[[str], None] = None,
             res: int = 512,
             **kwargs  # Ignore rest of kwargs
@@ -250,6 +292,8 @@ class OpenposeModel(object):
             include_body=include_body,
             include_hand=include_hand,
             include_face=include_face,
+            use_dw_pose=use_dw_pose,
+            use_animal_pose=use_animal_pose,
             json_pose_callback=json_pose_callback
         )), True
 
@@ -331,30 +375,29 @@ def unload_pidinet():
         unload_pid_model()
 
 
-clip_encoder = None
+clip_encoder = {
+    'clip_g': None,
+    'clip_h': None,
+    'clip_vitl': None,
+}
 
 
-def clip(img, res=512, **kwargs):
-    img = HWC3(img)
+def clip(img, res=512, config='clip_vitl', low_vram=False, **kwargs):
     global clip_encoder
-    if clip_encoder is None:
-        from annotator.clip import apply_clip
-        clip_encoder = apply_clip
-    result = clip_encoder(img)
+    if clip_encoder[config] is None:
+        from annotator.clipvision import ClipVisionDetector
+        if low_vram:
+            logger.info("Loading CLIP model on CPU.")
+        clip_encoder[config] = ClipVisionDetector(config, low_vram)
+    result = clip_encoder[config](img)
     return result, False
 
 
-def clip_vision_visualization(x):
-    x = x.detach().cpu().numpy()[0]
-    x = np.ascontiguousarray(x).copy()
-    return np.ndarray((x.shape[0] * 4, x.shape[1]), dtype="uint8", buffer=x.tobytes())
-
-
-def unload_clip():
+def unload_clip(config='clip_vitl'):
     global clip_encoder
-    if clip_encoder is not None:
-        from annotator.clip import unload_clip_model
-        unload_clip_model()
+    if clip_encoder[config] is not None:
+        clip_encoder[config].unload_model()
+        clip_encoder[config] = None
 
 
 model_color = None
@@ -465,6 +508,43 @@ def unload_lineart_anime_denoise():
         model_manga_line.unload_model()
 
 
+model_lama = None
+
+
+def lama_inpaint(img, res=512, **kwargs):
+    H, W, C = img.shape
+    raw_color = img[:, :, 0:3].copy()
+    raw_mask = img[:, :, 3:4].copy()
+
+    res = 256  # Always use 256 since lama is trained on 256
+
+    img_res, remove_pad = resize_image_with_pad(img, res, skip_hwc3=True)
+
+    global model_lama
+    if model_lama is None:
+        from annotator.lama import LamaInpainting
+        model_lama = LamaInpainting()
+
+    # applied auto inversion
+    prd_color = model_lama(img_res)
+    prd_color = remove_pad(prd_color)
+    prd_color = cv2.resize(prd_color, (W, H))
+
+    alpha = raw_mask.astype(np.float32) / 255.0
+    fin_color = prd_color.astype(np.float32) * alpha + raw_color.astype(np.float32) * (1 - alpha)
+    fin_color = fin_color.clip(0, 255).astype(np.uint8)
+
+    result = np.concatenate([fin_color, raw_mask], axis=2)
+
+    return result, True
+
+
+def unload_lama_inpaint():
+    global model_lama
+    if model_lama is not None:
+        model_lama.unload_model()
+
+
 model_zoe_depth = None
 
 
@@ -555,10 +635,276 @@ def shuffle(img, res=512, **kwargs):
     return result, True
 
 
+def recolor_luminance(img, res=512, thr_a=1.0, **kwargs):
+    result = cv2.cvtColor(HWC3(img), cv2.COLOR_BGR2LAB)
+    result = result[:, :, 0].astype(np.float32) / 255.0
+    result = result ** thr_a
+    result = (result * 255.0).clip(0, 255).astype(np.uint8)
+    result = cv2.cvtColor(result, cv2.COLOR_GRAY2RGB)
+    return result, True
+
+
+def recolor_intensity(img, res=512, thr_a=1.0, **kwargs):
+    result = cv2.cvtColor(HWC3(img), cv2.COLOR_BGR2HSV)
+    result = result[:, :, 2].astype(np.float32) / 255.0
+    result = result ** thr_a
+    result = (result * 255.0).clip(0, 255).astype(np.uint8)
+    result = cv2.cvtColor(result, cv2.COLOR_GRAY2RGB)
+    return result, True
+
+
+def blur_gaussian(img, res=512, thr_a=1.0, **kwargs):
+    img, remove_pad = resize_image_with_pad(img, res)
+    img = remove_pad(img)
+    result = cv2.GaussianBlur(img, (0, 0), float(thr_a))
+    return result, True
+
+
+model_anime_face_segment = None
+
+
+def anime_face_segment(img, res=512, **kwargs):
+    img, remove_pad = resize_image_with_pad(img, res)
+    global model_anime_face_segment
+    if model_anime_face_segment is None:
+        from annotator.anime_face_segment import AnimeFaceSegment
+        model_anime_face_segment = AnimeFaceSegment()
+
+    result = model_anime_face_segment(img)
+    return remove_pad(result), True
+
+
+def unload_anime_face_segment():
+    global model_anime_face_segment
+    if model_anime_face_segment is not None:
+        model_anime_face_segment.unload_model()
+
+
+
+def densepose(img, res=512, cmap="viridis", **kwargs):
+    img, remove_pad = resize_image_with_pad(img, res)
+    from annotator.densepose import apply_densepose
+    result = apply_densepose(img, cmap=cmap)
+    return remove_pad(result), True
+
+
+def unload_densepose():
+    from annotator.densepose import unload_model
+    unload_model()
+
+model_te_hed = None
+
+def te_hed(img, res=512, thr_a=2, **kwargs):
+    img, remove_pad = resize_image_with_pad(img, res)
+    global model_te_hed
+    if model_te_hed is None:
+        from annotator.teed import TEEDDector
+        model_te_hed = TEEDDector()
+    result = model_te_hed(img, safe_steps=int(thr_a))
+    return remove_pad(result), True
+
+def unload_te_hed():
+    if model_te_hed is not None:
+        model_te_hed.unload_model()
+
+
+model_normal_dsine = None
+
+
+def normal_dsine(img, res=512, thr_a=60.0,thr_b=5, **kwargs):
+    global model_normal_dsine
+    if model_normal_dsine is None:
+        from annotator.normaldsine import NormalDsineDetector
+        model_normal_dsine = NormalDsineDetector()
+    result = model_normal_dsine(img, new_fov=float(thr_a), iterations=int(thr_b), resulotion=res)
+    return result, True
+
+
+def unload_normal_dsine():
+    global model_normal_dsine
+    if model_normal_dsine is not None:
+        model_normal_dsine.unload_model()
+
+
+class InsightFaceModel:
+    def __init__(self, face_analysis_model_name: str = "buffalo_l"):
+        self.model = None
+        self.face_analysis_model_name = face_analysis_model_name
+        self.antelopev2_installed = False
+
+    def install_antelopev2(self):
+        """insightface's github release on antelopev2 model is down. Downloading
+        from huggingface mirror."""
+        from scripts.utils import load_file_from_url
+        from annotator.annotator_path import models_path
+        model_root = os.path.join(models_path, "insightface", "models", "antelopev2")
+        if not model_root:
+            os.makedirs(model_root, exist_ok=True)
+        for local_file, url in (
+            ("1k3d68.onnx", "https://huggingface.co/DIAMONIK7777/antelopev2/resolve/main/1k3d68.onnx"),
+            ("2d106det.onnx", "https://huggingface.co/DIAMONIK7777/antelopev2/resolve/main/2d106det.onnx"),
+            ("genderage.onnx", "https://huggingface.co/DIAMONIK7777/antelopev2/resolve/main/genderage.onnx"),
+            ("glintr100.onnx", "https://huggingface.co/DIAMONIK7777/antelopev2/resolve/main/glintr100.onnx"),
+            ("scrfd_10g_bnkps.onnx", "https://huggingface.co/DIAMONIK7777/antelopev2/resolve/main/scrfd_10g_bnkps.onnx"),
+        ):
+            local_path = os.path.join(model_root, local_file)
+            if not os.path.exists(local_path):
+                load_file_from_url(url, model_dir=model_root)
+        self.antelopev2_installed = True
+
+    def load_model(self):
+        if self.model is None:
+            from insightface.app import FaceAnalysis
+            from annotator.annotator_path import models_path
+            self.model = FaceAnalysis(
+                name=self.face_analysis_model_name,
+                providers=['CUDAExecutionProvider', 'CPUExecutionProvider'],
+                root=os.path.join(models_path, "insightface"),
+            )
+            self.model.prepare(ctx_id=0, det_size=(640, 640))
+
+    def run_model(self, img: np.ndarray, **kwargs) -> Tuple[torch.Tensor, bool]:
+        self.load_model()
+        assert img.shape[2] == 3, f"Expect RGB channels, but get {img.shape}"
+        faces = self.model.get(img)
+        if not faces:
+            raise Exception("Insightface: No face found in image.")
+        if len(faces) > 1:
+            logger.warn("Insightface: More than one face is detected in the image. "
+                        "Only the first one will be used.")
+        return torch.from_numpy(faces[0].normed_embedding).unsqueeze(0), False
+
+    def run_model_instant_id(
+        self,
+        img: np.ndarray,
+        res: int = 512,
+        return_keypoints: bool = False,
+        **kwargs
+    ) -> Tuple[Union[np.ndarray, torch.Tensor], bool]:
+        """Run the insightface model for instant_id.
+        Arguments:
+            - img: Input image in any size.
+            - res: Resolution used to resize image.
+            - return_keypoints: Whether to return keypoints image or face embedding.
+        """
+        def draw_kps(img: np.ndarray, kps, color_list=[(255,0,0), (0,255,0), (0,0,255), (255,255,0), (255,0,255)]):
+            stickwidth = 4
+            limbSeq = np.array([[0, 2], [1, 2], [3, 2], [4, 2]])
+            kps = np.array(kps)
+
+            h, w, _ = img.shape
+            out_img = np.zeros([h, w, 3])
+
+            for i in range(len(limbSeq)):
+                index = limbSeq[i]
+                color = color_list[index[0]]
+
+                x = kps[index][:, 0]
+                y = kps[index][:, 1]
+                length = ((x[0] - x[1]) ** 2 + (y[0] - y[1]) ** 2) ** 0.5
+                angle = math.degrees(math.atan2(y[0] - y[1], x[0] - x[1]))
+                polygon = cv2.ellipse2Poly((int(np.mean(x)), int(np.mean(y))), (int(length / 2), stickwidth), int(angle), 0, 360, 1)
+                out_img = cv2.fillConvexPoly(out_img.copy(), polygon, color)
+            out_img = (out_img * 0.6).astype(np.uint8)
+
+            for idx_kp, kp in enumerate(kps):
+                color = color_list[idx_kp]
+                x, y = kp
+                out_img = cv2.circle(out_img.copy(), (int(x), int(y)), 10, color, -1)
+
+            return out_img.astype(np.uint8)
+
+        if not self.antelopev2_installed:
+            self.install_antelopev2()
+        self.load_model()
+
+        img, remove_pad = resize_image_with_pad(img, res)
+        face_info = self.model.get(img)
+        if not face_info:
+            raise Exception("Insightface: No face found in image.")
+        if len(face_info) > 1:
+            logger.warn("Insightface: More than one face is detected in the image. "
+                        "Only the biggest one will be used.")
+        # only use the maximum face
+        face_info = sorted(face_info, key=lambda x:(x['bbox'][2]-x['bbox'][0])*(x['bbox'][3]-x['bbox'][1]))[-1]
+        if return_keypoints:
+            return remove_pad(draw_kps(img, face_info['kps'])), True
+        else:
+            return torch.from_numpy(face_info['embedding']), False
+
+
+g_insight_face_model = InsightFaceModel()
+g_insight_face_instant_id_model = InsightFaceModel(face_analysis_model_name="antelopev2")
+
+
+@dataclass
+class FaceIdPlusInput:
+    face_embed: torch.Tensor
+    clip_embed: CLIPVisionModelOutput
+
+
+def face_id_plus(img, low_vram=False, **kwargs):
+    """ FaceID plus uses both face_embeding from insightface and clip_embeding from clip. """
+    face_embed, _ = g_insight_face_model.run_model(img)
+    clip_embed, _ = clip(img, config='clip_h', low_vram=low_vram)
+    return FaceIdPlusInput(face_embed, clip_embed), False
+
+
+class HandRefinerModel:
+    def __init__(self):
+        self.model = None
+        self.device = devices.get_device_for("controlnet")
+
+    def load_model(self):
+        if self.model is None:
+            from annotator.annotator_path import models_path
+            from hand_refiner import MeshGraphormerDetector  # installed via hand_refiner_portable
+            with Extra(torch_handler):
+                self.model = MeshGraphormerDetector.from_pretrained(
+                    "hr16/ControlNet-HandRefiner-pruned",
+                    cache_dir=os.path.join(models_path, "hand_refiner"),
+                    device=self.device,
+                )
+        else:
+            self.model.to(self.device)
+
+    def unload(self):
+        if self.model is not None:
+            self.model.to("cpu")
+
+    def run_model(self, img, res=512, **kwargs):
+        img, remove_pad = resize_image_with_pad(img, res)
+        self.load_model()
+        with Extra(torch_handler):
+            depth_map, mask, info = self.model(
+                img, output_type="np",
+                detect_resolution=res,
+                mask_bbox_padding=30,
+            )
+        return remove_pad(depth_map), True
+
+
+g_hand_refiner_model = HandRefinerModel()
+
+
 model_free_preprocessors = [
     "reference_only",
     "reference_adain",
-    "reference_adain+attn"
+    "reference_adain+attn",
+    "revision_clipvision",
+    "revision_ignore_prompt"
+]
+
+no_control_mode_preprocessors = [
+    "revision_clipvision",
+    "revision_ignore_prompt",
+    "clip_vision",
+    "ip-adapter_clip_sd15",
+    "ip-adapter_clip_sdxl",
+    "ip-adapter_clip_sdxl_plus_vith",
+    "t2ia_style_clipvision",
+    "ip-adapter_face_id",
+    "ip-adapter_face_id_plus",
 ]
 
 flag_preprocessor_resolution = "Preprocessor Resolution"
@@ -566,6 +912,24 @@ preprocessor_sliders_config = {
     "none": [],
     "inpaint": [],
     "inpaint_only": [],
+    "revision_clipvision": [
+        None,
+        {
+            "name": "Noise Augmentation",
+            "value": 0.0,
+            "min": 0.0,
+            "max": 1.0
+        },
+    ],
+    "revision_ignore_prompt": [
+        None,
+        {
+            "name": "Noise Augmentation",
+            "value": 0.0,
+            "min": 0.0,
+            "max": 1.0
+        },
+    ],
     "canny": [
         {
             "name": flag_preprocessor_resolution,
@@ -641,6 +1005,22 @@ preprocessor_sliders_config = {
         }
     ],
     "openpose_full": [
+        {
+            "name": flag_preprocessor_resolution,
+            "min": 64,
+            "max": 2048,
+            "value": 512
+        }
+    ],
+    "dw_openpose_full": [
+        {
+            "name": flag_preprocessor_resolution,
+            "min": 64,
+            "max": 2048,
+            "value": 512
+        }
+    ],
+    "animal_openpose": [
         {
             "name": flag_preprocessor_resolution,
             "min": 64,
@@ -752,6 +1132,20 @@ preprocessor_sliders_config = {
             "value": 32,
         }
     ],
+    "blur_gaussian": [
+        {
+            "name": flag_preprocessor_resolution,
+            "value": 512,
+            "min": 64,
+            "max": 2048
+        },
+        {
+            "name": "Sigma",
+            "min": 0.01,
+            "max": 64.0,
+            "value": 9.0,
+        }
+    ],
     "tile_resample": [
         None,
         {
@@ -819,6 +1213,7 @@ preprocessor_sliders_config = {
             "step": 0.01
         }
     ],
+    "inpaint_only+lama": [],
     "color": [
         {
             "name": flag_preprocessor_resolution,
@@ -849,23 +1244,128 @@ preprocessor_sliders_config = {
             "step": 0.01
         }
     ],
+    "recolor_luminance": [
+        None,
+        {
+            "name": "Gamma Correction",
+            "value": 1.0,
+            "min": 0.1,
+            "max": 2.0,
+            "step": 0.001
+        }
+    ],
+    "recolor_intensity": [
+        None,
+        {
+            "name": "Gamma Correction",
+            "value": 1.0,
+            "min": 0.1,
+            "max": 2.0,
+            "step": 0.001
+        }
+    ],
+    "anime_face_segment": [
+        {
+            "name": flag_preprocessor_resolution,
+            "value": 512,
+            "min": 64,
+            "max": 2048
+        }
+    ],
+    "densepose": [
+        {
+            "name": flag_preprocessor_resolution,
+            "min": 64,
+            "max": 2048,
+            "value": 512
+        }
+    ],
+    "densepose_parula": [
+        {
+            "name": flag_preprocessor_resolution,
+            "min": 64,
+            "max": 2048,
+            "value": 512
+        }
+    ],
+    "depth_hand_refiner": [
+        {
+            "name": flag_preprocessor_resolution,
+            "value": 512,
+            "min": 64,
+            "max": 2048
+        }
+    ],
+    "te_hed": [
+        {
+            "name": flag_preprocessor_resolution,
+            "value": 512,
+            "min": 64,
+            "max": 2048
+        },
+        {
+            "name": "Safe Steps",
+            "min": 0,
+            "max": 10,
+            "value": 2,
+            "step": 1,
+        },
+    ],
+    "normal_dsine": [
+        {
+            "name": flag_preprocessor_resolution,
+            "min": 64,
+            "max": 2048,
+            "value": 512
+        },
+        {
+            "name": "Fov",
+            "min": 0.0,
+            "max": 360.0,
+            "value": 60.0,
+            "step": 0.1,
+        },
+        {
+            "name": "Iterations",
+            "min": 1,
+            "max": 20,
+            "value": 5,
+            "step": 1,
+        },
+    ],
 }
 
 preprocessor_filters = {
     "All": "none",
     "Canny": "canny",
     "Depth": "depth_midas",
-    "Normal": "normal_bae",
+    "NormalMap": "normal_bae",
     "OpenPose": "openpose_full",
     "MLSD": "mlsd",
     "Lineart": "lineart_standard (from white bg & black line)",
     "SoftEdge": "softedge_pidinet",
-    "Scribble": "scribble_pidinet",
-    "Seg": "seg_ofade20k",
+    "Scribble/Sketch": "scribble_pidinet",
+    "Segmentation": "seg_ofade20k",
     "Shuffle": "shuffle",
-    "Tile": "tile_resample",
+    "Tile/Blur": "tile_resample",
     "Inpaint": "inpaint_only",
-    "IP2P": "none",
+    "InstructP2P": "none",
     "Reference": "reference_only",
-    "T2IA": "none",
+    "Recolor": "recolor_luminance",
+    "Revision": "revision_clipvision",
+    "T2I-Adapter": "none",
+    "IP-Adapter": "ip-adapter-auto",
+    "Instant_ID": "instant_id",
+    "SparseCtrl": "none",
 }
+
+preprocessor_filters_aliases = {
+    'instructp2p': ['ip2p'],
+    'segmentation': ['seg'],
+    'normalmap': ['normal'],
+    't2i-adapter': ['t2i_adapter', 't2iadapter', 't2ia'],
+    'ip-adapter': ['ip_adapter', 'ipadapter'],
+    'scribble/sketch': ['scribble', 'sketch'],
+    'tile/blur': ['tile', 'blur'],
+    'openpose':['openpose', 'densepose'],
+}  # must use all lower texts
